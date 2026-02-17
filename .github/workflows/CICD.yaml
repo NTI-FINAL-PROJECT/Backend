@@ -1,0 +1,862 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [dev]
+
+env:
+  SHORT_SHA: ""
+
+# ============================================================
+# PIPELINE ORDER:
+# 1. Credential Check (Secret Scanning)
+# 2. SAST (Static Application Security Testing)
+# 3. Build Docker Image
+# 4. DAST (Dynamic Application Security Testing)
+# 5. Sign Docker Image
+# 6. Update Helm Chart Values (GitOps)
+# ============================================================
+
+jobs:
+  # ============================================================
+  # STAGE 1: CREDENTIAL CHECK (runs first)
+  # ============================================================
+  credential-check:
+    name: Credential Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        continue-on-error: true 
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        continue-on-error: true
+        uses: gitleaks/gitleaks-action@v2
+
+  # ============================================================
+  # STAGE 2: SAST - Static Application Security Testing
+  # (runs after credential check, before build)
+  # ============================================================
+
+  # SAST Job 1: Bandit - Python Security Scan
+  bandit:
+    name: Python Security Scan (Bandit)
+    runs-on: ubuntu-latest
+    needs: credential-check
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install Bandit
+        run: pip install bandit bandit-sarif-formatter
+
+      - name: Run Bandit (JSON output)
+        continue-on-error: true
+        run: bandit -r . -f json -o bandit-results.json --exclude ./.venv,./tests || true
+
+      - name: Run Bandit (SARIF output)
+        continue-on-error: true
+        run: bandit -r . -f sarif -o bandit-results.sarif --exclude ./.venv,./tests || true
+
+      - name: Run Bandit (HTML output)
+        continue-on-error: true
+        run: bandit -r . -f html -o bandit-report.html --exclude ./.venv,./tests || true
+
+      - name: Upload Bandit HTML Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bandit-security-report
+          path: bandit-report.html
+          retention-days: 30
+
+      - name: Upload Bandit SARIF Report
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: bandit-results.sarif
+
+      - name: Bandit Summary
+        if: always()
+        run: |
+          echo "### Bandit Python Security Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f bandit-results.json ]; then
+            HIGH=$(python3 -c "import json; d=json.load(open('bandit-results.json')); print(len([r for r in d.get('results',[]) if r.get('issue_severity')=='HIGH']))" 2>/dev/null || echo "0")
+            MEDIUM=$(python3 -c "import json; d=json.load(open('bandit-results.json')); print(len([r for r in d.get('results',[]) if r.get('issue_severity')=='MEDIUM']))" 2>/dev/null || echo "0")
+            LOW=$(python3 -c "import json; d=json.load(open('bandit-results.json')); print(len([r for r in d.get('results',[]) if r.get('issue_severity')=='LOW']))" 2>/dev/null || echo "0")
+            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| High | ${HIGH} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Medium | ${MEDIUM} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Low | ${LOW} |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # SAST Job 2: Code Quality and Linting
+  code-quality:
+    name: Code Quality Check
+    runs-on: ubuntu-latest
+    needs: credential-check
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          pip install flake8
+
+      - name: Lint with flake8
+        run: |
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+  # SAST Job 3: Semgrep - Static Application Security Testing
+  sast-semgrep:
+    name: Semgrep SAST Scan
+    runs-on: ubuntu-latest
+    needs: credential-check
+    permissions:
+      contents: read
+      security-events: write
+    container:
+      image: semgrep/semgrep
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Run Semgrep Full Scan
+        run: |
+          semgrep scan --config auto --json --output semgrep-results.json . || true
+          echo "Semgrep scan completed"
+
+      - name: Run Semgrep SARIF Output
+        continue-on-error: true
+        run: |
+          semgrep scan --config auto --sarif --output semgrep-results.sarif . || true
+
+      - name: Upload Semgrep SARIF Report
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        continue-on-error: true
+        with:
+          sarif_file: semgrep-results.sarif
+
+      - name: Generate HTML Report from Template
+        if: always()
+        run: |
+          python3 .github/scripts/generate-report.py semgrep semgrep-results.json semgrep-report.html
+
+      - name: Upload Semgrep HTML Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-security-report
+          path: semgrep-report.html
+          retention-days: 30
+
+      - name: Upload Semgrep JSON Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-json-results
+          path: semgrep-results.json
+          retention-days: 30
+
+      - name: Semgrep Summary
+        if: always()
+        run: |
+          echo "### Semgrep SAST Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f semgrep-results.json ]; then
+            FINDINGS=$(cat semgrep-results.json | python3 -c "import sys,json; data=json.load(sys.stdin); print(len(data.get('results',[])))" 2>/dev/null || echo "N/A")
+            echo "Total findings: **${FINDINGS}**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "No results file generated" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # SAST Job 4: Snyk Code Scan (SAST only - no container scan yet)
+  snyk-code:
+    name: Snyk Code SAST Scan
+    runs-on: ubuntu-latest
+    needs: credential-check
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (if applicable)
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          elif [ -f package.json ]; then
+            npm install
+          fi
+
+      - name: Pull Snyk Docker image
+        run: docker pull snyk/snyk:node
+
+      - name: Snyk Open Source Scan (Dependencies)
+        continue-on-error: true
+        run: |
+          echo "Scanning dependencies for vulnerabilities..."
+          docker run --rm \
+            -e SNYK_TOKEN=${{ secrets.SNYK_TOKEN }} \
+            -v ${{ github.workspace }}:/project \
+            snyk/snyk:node test \
+            --json > snyk-opensource-results.json 2>&1 || true
+          echo "Snyk Open Source scan completed"
+
+      - name: Snyk Code Scan (SAST)
+        continue-on-error: true
+        run: |
+          echo "Scanning source code for vulnerabilities..."
+          docker run --rm \
+            -e SNYK_TOKEN=${{ secrets.SNYK_TOKEN }} \
+            -v ${{ github.workspace }}:/project \
+            snyk/snyk:node code test \
+            --json > snyk-code-results.json 2>&1 || true
+          echo "Snyk Code scan completed"
+
+      - name: Upload Snyk JSON Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: snyk-sast-results
+          path: |
+            snyk-opensource-results.json
+            snyk-code-results.json
+          retention-days: 30
+
+      - name: Snyk SAST Summary
+        if: always()
+        run: |
+          echo "### Snyk SAST Results" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan Type | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          if [ -f snyk-opensource-results.json ]; then
+            VULNS=$(python3 -c "import json; data=json.load(open('snyk-opensource-results.json')); print(data.get('uniqueCount', len(data.get('vulnerabilities',[]))))" 2>/dev/null || echo "N/A")
+            echo "| Open Source Dependencies | ${VULNS} vulnerabilities |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Open Source Dependencies | No results |" >> $GITHUB_STEP_SUMMARY
+          fi
+          if [ -f snyk-code-results.json ]; then
+            echo "| Code (SAST) | Completed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Code (SAST) | No results |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # SAST Job 5: Application Tests
+  application-tests:
+    name: Application Tests
+    runs-on: ubuntu-latest
+    needs: credential-check
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-html
+
+      - name: Run tests with coverage
+        env:
+          DATABASE_URL: "sqlite:///:memory:"
+        run: |
+          pytest tests/ -v \
+            --cov=app \
+            --cov-report=xml \
+            --cov-report=html \
+            --cov-report=term-missing \
+            --junitxml=test-results.xml \
+            --html=test-report.html \
+            --self-contained-html
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: |
+            test-results.xml
+            test-report.html
+            htmlcov/
+          retention-days: 30
+
+      - name: Upload coverage to summary
+        if: always()
+        run: |
+          echo "### Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f test-results.xml ]; then
+            TESTS=$(grep -oP 'tests="\K[^"]+' test-results.xml | head -1)
+            FAILURES=$(grep -oP 'failures="\K[^"]+' test-results.xml | head -1)
+            ERRORS=$(grep -oP 'errors="\K[^"]+' test-results.xml | head -1)
+            echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| Total Tests | ${TESTS:-0} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Failures | ${FAILURES:-0} |" >> $GITHUB_STEP_SUMMARY
+            echo "| Errors | ${ERRORS:-0} |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # ============================================================
+  # STAGE 3: BUILD (depends on all SAST jobs)
+  # ============================================================
+  build:
+    name: Build Docker Image
+    runs-on: ubuntu-latest
+    needs:
+      - bandit
+      - code-quality
+      - sast-semgrep
+      - snyk-code
+      - application-tests
+    outputs:
+      image_digest: ${{ steps.digest.outputs.image_digest }}
+      short_sha: ${{ steps.vars.outputs.short_sha }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set short SHA
+        id: vars
+        run: |
+          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Short SHA: ${SHORT_SHA}"
+
+      - name: Check if Dockerfile exists
+        id: dockerfile-check
+        run: |
+          if [ -f "Dockerfile" ]; then
+            echo "Dockerfile found"
+            echo "dockerfile_exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "Dockerfile not found"
+            echo "dockerfile_exists=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          echo "Building Docker image..."
+          docker build -t backend-app:${{ steps.vars.outputs.short_sha }} .
+          echo "Docker image built successfully with tag: ${{ steps.vars.outputs.short_sha }}"
+
+      - name: Get image digest
+        id: digest
+        run: |
+          IMAGE_ID=$(docker images --no-trunc --quiet backend-app:${{ steps.vars.outputs.short_sha }})
+          echo "image_digest=sha256:${IMAGE_ID#sha256:}" >> $GITHUB_OUTPUT
+          echo "Image digest: sha256:${IMAGE_ID#sha256:}"
+
+      - name: Save Docker image as artifact
+        run: |
+          docker save backend-app:${{ steps.vars.outputs.short_sha }} | gzip > backend-app-image.tar.gz
+          ls -lh backend-app-image.tar.gz
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: backend-app-image.tar.gz
+          retention-days: 1
+
+  # ============================================================
+  # STAGE 4: DAST - Dynamic Application Security Testing
+  # (runs after build)
+  # ============================================================
+
+  # DAST Job 1: Trivy - Docker Image Security Scan
+  trivy-scan:
+    name: Trivy Container Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: |
+          gunzip -c backend-app-image.tar.gz | docker load
+          docker tag backend-app:${{ needs.build.outputs.short_sha }} backend-app:scan
+          echo "Docker image loaded and tagged for scanning"
+
+      - name: Run Trivy vulnerability scanner (Console Output)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "backend-app:scan"
+          format: "table"
+          exit-code: "0"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
+
+      - name: Run Trivy vulnerability scanner (JSON Output)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "backend-app:scan"
+          format: "json"
+          output: "trivy-results.json"
+          exit-code: "0"
+          ignore-unfixed: true
+          severity: "CRITICAL,HIGH"
+
+      - name: Generate HTML Report from Template
+        if: always()
+        run: |
+          python3 .github/scripts/generate-report.py trivy trivy-results.json trivy-report.html
+
+      - name: Upload Trivy HTML Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-security-report
+          path: trivy-report.html
+          retention-days: 30
+
+  # DAST Job 2: Snyk Container Scan
+  snyk-container:
+    name: Snyk Container DAST Scan
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        run: |
+          gunzip -c backend-app-image.tar.gz | docker load
+          docker tag backend-app:${{ needs.build.outputs.short_sha }} backend-app:snyk-scan
+          echo "Docker image loaded successfully"
+
+      - name: Snyk Container Scan
+        continue-on-error: true
+        run: |
+          echo "Scanning Docker image for vulnerabilities..."
+          docker run --rm \
+            -e SNYK_TOKEN=${{ secrets.SNYK_TOKEN }} \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            snyk/snyk:docker snyk container test backend-app:snyk-scan \
+            --json > snyk-container-results.json 2>&1 || true
+          echo "Snyk Container scan completed"
+
+      - name: Generate Snyk HTML Report
+        if: always()
+        run: |
+          python3 .github/scripts/generate-report.py snyk-combined snyk-container-report.html "Container Image,container,snyk-container-results.json"
+
+      - name: Upload Snyk Container Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: snyk-container-report
+          path: |
+            snyk-container-report.html
+            snyk-container-results.json
+          retention-days: 30
+
+      - name: Snyk Container Summary
+        if: always()
+        run: |
+          echo "### Snyk Container Scan Results" >> $GITHUB_STEP_SUMMARY
+          if [ -f snyk-container-results.json ]; then
+            echo "| Container Image | Completed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| Container Image | No results |" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  # DAST Job 3: OWASP ZAP - Dynamic Application Security Testing
+  dast-zap:
+    name: OWASP ZAP DAST Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Start app for ZAP scan
+        env:
+          DATABASE_URL: sqlite:////tmp/zap.db
+        run: |
+          python app.py > app.log 2>&1 &
+          echo "APP_PID=$!" >> $GITHUB_ENV
+
+      - name: Wait for app to be ready
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://127.0.0.1:5000/health >/dev/null; then
+              echo "App is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "App did not become ready in time"
+          echo "App logs:"
+          tail -n 200 app.log || true
+          exit 1
+
+      - name: Set ZAP target
+        run: |
+          echo "ZAP_TARGET=http://127.0.0.1:5000" >> $GITHUB_ENV
+
+      - name: ZAP Scan
+        uses: zaproxy/action-full-scan@v0.13.0
+        with:
+          docker_name: 'ghcr.io/zaproxy/zaproxy:stable'
+          target: ${{ env.ZAP_TARGET }}
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a -I -x baseline.xml -J zap-report.json'
+
+      - name: Generate ZAP HTML Report from Template
+        if: always()
+        run: |
+          python3 .github/scripts/generate-report.py zap baseline.xml zap-report.html
+
+      - name: Upload ZAP HTML Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-security-report
+          path: zap-report.html
+          retention-days: 30
+
+      - name: Upload ZAP XML Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-baseline-report
+          path: baseline.xml
+          retention-days: 30
+
+      - name: Upload ZAP JSON Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-json-report
+          path: zap-report.json
+          retention-days: 30
+
+      - name: Stop app
+        if: always()
+        run: |
+          if [ -n "$APP_PID" ]; then
+            kill "$APP_PID" || true
+          fi
+
+  # ============================================================
+  # STAGE 5: SIGN AND PUSH (runs after ALL DAST jobs pass)
+  # ============================================================
+  cosign-sign:
+    name: Sign and Push Docker Image
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - trivy-scan
+      - snyk-container
+      - dast-zap
+    environment: ECR_REPOSITORY
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Docker image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker image
+        id: load
+        run: |
+          SHORT_SHA="${{ needs.build.outputs.short_sha }}"
+          gunzip -c backend-app-image.tar.gz | docker load
+          IMAGE_ID=$(docker images --no-trunc --quiet backend-app:${SHORT_SHA})
+          IMAGE_DIGEST="backend-app@sha256:${IMAGE_ID#sha256:}"
+          echo "image_digest=${IMAGE_DIGEST}" >> $GITHUB_OUTPUT
+          echo "image_tag=backend-app:${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Docker image loaded: ${IMAGE_DIGEST}"
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.4.0
+
+      - name: Sign Docker image with Cosign (Keyless)
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          echo "Signing image with Cosign (keyless mode)..."
+          echo "Creating signature attestation for local image..."
+
+          cat > image-signature.json << EOF
+          {
+            "image": "${{ steps.load.outputs.image_tag }}",
+            "digest": "${{ steps.load.outputs.image_digest }}",
+            "repository": "${{ github.repository }}",
+            "commit": "${{ github.sha }}",
+            "workflow": "${{ github.workflow }}",
+            "run_id": "${{ github.run_id }}",
+            "actor": "${{ github.actor }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "signed_by": "GitHub Actions OIDC",
+            "build_url": "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }
+          EOF
+
+          echo "Image attestation created"
+          cat image-signature.json
+
+      - name: Upload Image Signature Attestation
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-signature-attestation
+          path: image-signature.json
+          retention-days: 90
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag and Push to Amazon ECR
+        id: push-ecr
+        run: |
+          ECR_REGISTRY="288378107043.dkr.ecr.us-east-1.amazonaws.com"
+          ECR_REPOSITORY="final/backend"
+          SHORT_SHA="${{ steps.load.outputs.short_sha }}"
+          FULL_IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${SHORT_SHA}"
+
+          echo "Tagging image for ECR..."
+          docker tag backend-app:${SHORT_SHA} ${FULL_IMAGE}
+          docker tag backend-app:${SHORT_SHA} ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+
+          echo "Pushing image to ECR..."
+          docker push ${FULL_IMAGE}
+          docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+
+          echo "full_image=${FULL_IMAGE}" >> $GITHUB_OUTPUT
+          echo "short_sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Image pushed successfully: ${FULL_IMAGE}"
+
+      - name: Sign image in ECR with Cosign
+        env:
+          COSIGN_EXPERIMENTAL: "true"
+        run: |
+          echo "Signing image in ECR..."
+          cosign sign --yes ${{ steps.push-ecr.outputs.full_image }}
+          echo "Image signed in registry"
+
+      - name: Generate summary
+        run: |
+          echo "### Sign and Push Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Property | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | ${{ steps.push-ecr.outputs.full_image }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Digest | ${{ steps.load.outputs.image_digest }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Signed | Yes (Cosign keyless) |" >> $GITHUB_STEP_SUMMARY
+          echo "| Registry | Amazon ECR |" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================
+  # STAGE 6: UPDATE HELM CHART VALUES
+  # (runs after signing to update the Helm charts with new image tag)
+  # ============================================================
+  update-helm:
+    name: Update Helm Chart Values
+    runs-on: ubuntu-latest
+    needs:
+      - build
+      - cosign-sign
+    environment: UPDATE_HELLM
+    steps:
+      - name: Checkout Helm Repository
+        uses: actions/checkout@v4
+        with:
+          repository: mahmoudsallem/Hellm
+          ref: dev
+          token: ${{ secrets.HELM_REPO_PAT }}
+          path: helm-repo
+
+      - name: Update Image Tags in Helm Values
+        run: |
+          IMAGE_TAG="${{ needs.build.outputs.short_sha }}"
+          echo "Updating Helm chart values with image tag: ${IMAGE_TAG}"
+
+          # Update backend values.yaml only
+          if [ -f helm-repo/helm/Dev/backend/values.yaml ]; then
+            sed -i "s|tag:.*|tag: \"${IMAGE_TAG}\"|g" helm-repo/helm/Dev/backend/values.yaml
+            echo "Updated backend values.yaml"
+          fi
+
+          echo "Backend Helm chart values updated"
+
+      - name: Commit and Push Changes
+        run: |
+          cd helm-repo
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          git add -A
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update image tag to ${{ needs.build.outputs.short_sha }}
+
+            Triggered by: ${{ github.repository }}
+            Workflow: ${{ github.workflow }}
+            Run ID: ${{ github.run_id }}
+            Actor: ${{ github.actor }}"
+
+            git push origin dev
+            echo "Changes pushed to Hellm repository"
+          fi
+
+      - name: Helm Update Summary
+        run: |
+          echo "### Helm Chart Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Application | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Backend | Updated |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Image Tag: \`${{ needs.build.outputs.short_sha }}\`" >> $GITHUB_STEP_SUMMARY
+
+  # ============================================================
+  # FINAL: SUMMARY (runs after everything completes)
+  # ============================================================
+  summary:
+    name: Pipeline Summary
+    runs-on: ubuntu-latest
+    needs:
+      - credential-check
+      - bandit
+      - code-quality
+      - sast-semgrep
+      - snyk-code
+      - application-tests
+      - build
+      - trivy-scan
+      - snyk-container
+      - dast-zap
+      - cosign-sign
+      - update-helm
+    if: always()
+    environment: SLACK_WEBHOOK_URL
+    steps:
+      - name: Generate Pipeline Summary
+        run: |
+          echo "### CI/CD Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Stage 1: Credential Check" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Gitleaks | \`${{ needs.credential-check.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Stage 2: SAST (Static Analysis)" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Bandit (Python Security) | \`${{ needs.bandit.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Code Quality (flake8) | \`${{ needs.code-quality.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Semgrep (SAST) | \`${{ needs.sast-semgrep.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Snyk Code (SAST) | \`${{ needs.snyk-code.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Application Tests | \`${{ needs.application-tests.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Stage 3: Build" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Docker Image | \`${{ needs.build.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Stage 4: DAST (Dynamic Analysis)" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy Container Scan | \`${{ needs.trivy-scan.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Snyk Container Scan | \`${{ needs.snyk-container.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| OWASP ZAP (DAST) | \`${{ needs.dast-zap.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Stage 5: Sign & Push" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cosign Sign & ECR Push | \`${{ needs.cosign-sign.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "#### Stage 6: Update Helm Charts" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Update Helm Values | \`${{ needs.update-helm.result }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "Pipeline completed | Commit: \`${{ github.sha }}\` | Branch: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Notify Slack
+        if: always()
+        uses: rtCamp/action-slack-notify@v2
+        env:
+          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_CHANNEL: devops
+          SLACK_COLOR: ${{ job.status }}
+          SLACK_TITLE: "Backend CI/CD Pipeline"
+          SLACK_MESSAGE: |
+            *Status:* ${{ job.status }}
+            *Branch:* ${{ github.ref_name }}
+            *Commit:* ${{ github.sha }}
+            *Actor:* ${{ github.actor }}
+          SLACK_FOOTER: "GitHub Actions | ${{ github.repository }}"
